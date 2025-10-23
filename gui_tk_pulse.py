@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading, time, math, queue, subprocess, shlex
 from collections import deque
+from typing import Optional
 import numpy as np
 
 from matplotlib.figure import Figure
@@ -29,7 +30,7 @@ class AlarmDot(ttk.Frame):
     """一个小圆点指示灯"""
     def __init__(self, master, text):
         super().__init__(master)
-        self.canvas = tk.Canvas(self, width=16, height=16, highlightthickness=0, bg=self["background"])
+        self.canvas = tk.Canvas(self, width=16, height=16, highlightthickness=0, bg="white")
         self.canvas.grid(row=0, column=0, padx=(0,6))
         self.lbl = ttk.Label(self, text=text, width=10)
         self.lbl.grid(row=0, column=1)
@@ -40,7 +41,7 @@ class AlarmDot(ttk.Frame):
 
 class BackendThread(threading.Thread):
     """可切换：模拟数据 或 运行外部可执行文件读取 stdout 行"""
-    def __init__(self, q:queue.Queue, cmd:str|None=None):
+    def __init__(self, q:queue.Queue, cmd:Optional[str]=None):
         super().__init__(daemon=True); self.q=q; self.cmd=cmd; self.stop_flag=False
 
     def run(self):
@@ -73,10 +74,10 @@ class BackendThread(threading.Thread):
                 t=time.time()-t0
                 bpm=71.0 + 3.5*math.sin(2*math.pi*0.07*t) + 1.0*math.sin(2*math.pi*0.23*t)
                 self.q.put(("bpm",(time.time(), bpm)))
-                time.sleep(1.0/SAMPLE_HZ))
+                time.sleep(1.0/SAMPLE_HZ)
 
 class App:
-    def __init__(self, root, backend_cmd: str|None=None):
+    def __init__(self, root, backend_cmd: Optional[str]=None):
         self.root = root
         root.title("BMET2922 - Pulse Monitor")
         root.geometry("1080x720")
@@ -163,7 +164,7 @@ class App:
 
         # 后端线程（默认模拟）
         self.q = queue.Queue()
-        self.backend = BackendThread(self.q, backend_cmd=None)
+        self.backend = BackendThread(self.q, cmd=backend_cmd)
         self.backend.start()
 
         # 定时更新
