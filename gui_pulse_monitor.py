@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pulse Monitor GUI (PySimpleGUI 5.x + Matplotlib)
+Pulse Monitor GUI (PySimpleGUI 4.x/5.x Compatible + Matplotlib)
 - 单窗口：大号 BPM + 曲线（PPG / BPM 趋势切换）
 - ≥1Hz 更新；阈值报警；系统日志；延迟<2s
 - 与 C 程序通过 stdout 按行通讯（JSON 或 CSV）
@@ -17,6 +17,12 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+
+# ✅ 兼容 PySimpleGUI 4.x 与 5.x 的 shim（不需要私有 key）
+if not hasattr(sg, "set_options") and hasattr(sg, "SetOptions"):
+    def _set_options_compat(**kwargs):
+        sg.SetOptions(**kwargs)
+    sg.set_options = _set_options_compat
 
 BUFFER_SECONDS = 30
 UI_UPDATE_MS = 200
@@ -137,74 +143,4 @@ def main():
     status = sg.Text(" NORMAL ", key="-STAT-", font=("Inter", 16, "bold"),
                      text_color="white", background_color="#22aa22")
     canvas = sg.Canvas(key="-CANVAS-", size=(800, 400), background_color="black")
-    logbox = sg.Multiline(key="-LOG-", size=(48, 24), autoscroll=True, disabled=True)
-    low_in = sg.Input(f"{DEFAULT_LOW_BPM:.1f}", key="-LOW-", size=(6,1), justification="right")
-    high_in= sg.Input(f"{DEFAULT_HIGH_BPM:.1f}",key="-HIGH-",size=(6,1), justification="right")
-    layout = [
-        [sg.Text("Pulse Monitor", font=("Inter",18,"bold")), sg.Push(), bpm_big, sg.Push(), status],
-        [[sg.Text("Display:"), mode, auto, sg.Text("Y:"), y_min, y_max], [canvas],],
-        [sg.Text("System Log", font=("Inter",14,"bold")),],
-        [logbox],
-        [sg.Text("Low BPM:"), low_in, sg.Text("High BPM:"), high_in]
-    ]
-    win = sg.Window("BMET Pulse GUI", layout, finalize=True, resizable=True)
-
-    fig = Figure(figsize=(8,3), dpi=100); ax = fig.add_subplot(111); agg = _draw(win["-CANVAS-"], fig)
-    last_redraw = 0.0
-    cmd = None if args.backend is None else (args.backend if not args.args else f"{args.backend} {args.args}")
-    reader = BackendReader(q, cmd); reader.start()
-
-    def log(s: str):
-        cur = win["-LOG-"].get()
-        if cur.count("\n") > LOG_MAX_LINES: win["-LOG-"].update("")
-        win["-LOG-"].update(s+"\n", append=True)
-
-    last_bpm = None
-    while True:
-        ev, vals = win.read(timeout=UI_UPDATE_MS)
-        if ev in (sg.WINDOW_CLOSED, "Exit"): break
-        # drain queue
-        drained = 0
-        while True:
-            try: typ, payload = q.get_nowait()
-            except queue.Empty: break
-            if typ == "log": log(payload)
-            elif typ == "data":
-                buf.append(payload); last_bpm = payload.bpm; drained += 1
-        # BPM display + alarm
-        try:
-            low = float(vals["-LOW-"]); high = float(vals["-HIGH-"])
-        except Exception:
-            low, high = DEFAULT_LOW_BPM, DEFAULT_HIGH_BPM
-        if last_bpm is not None:
-            win["-BPM-"].update(f"{last_bpm:.1f}")
-            if last_bpm < low:  win["-STAT-"].update(" LOW ",  background_color="#ffaa00")
-            elif last_bpm > high: win["-STAT-"].update(" HIGH ", background_color="#cc2222")
-            else: win["-STAT-"].update(" NORMAL ", background_color="#22aa22")
-        # redraw (rate limited)
-        now = time.time()
-        if now - last_redraw >= PLOT_UPDATE_MS/1000.0:
-            last_redraw = now
-            ts, bpm, ppg = buf.arrays()
-            ax.cla()
-            if ts.size:
-                x = ts - ts[-1]
-                if vals["-MODE-"] == "PPG Waveform":
-                    ax.plot(x, ppg, linewidth=1.0)
-                    ax.set_ylabel("Amplitude")
-                    if not vals["-AUTO-"]:
-                        try: ax.set_ylim(float(vals["-YMIN-"]), float(vals["-YMAX-"]))
-                        except Exception: pass
-                else:
-                    ax.plot(x, _smooth(bpm, 5), linewidth=1.5)
-                    ax.set_ylabel("BPM")
-                ax.set_xlim(-buf.seconds, 0.0)
-                ax.set_title(f"{vals['-MODE-']} (last {buf.seconds:.0f}s)")
-                ax.set_xlabel("Time (s)"); ax.grid(True, alpha=0.3)
-            agg.draw()
-    try: reader.stop()
-    except Exception: pass
-    win.close()
-
-if __name__ == "__main__":
-    main()
+    logbox = sg.Multiline(key="-LOG-", size=(48, 24), autos
