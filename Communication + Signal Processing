@@ -1,0 +1,368 @@
+/*
+ * BMET2922 Wearable PPG – ESP32 Bluetooth SPP sender (final + signal processing)
+ *
+ * NEW (Signal Processing):
+ *   - Real-time band-pass filtering ≈ 0.5–5 Hz using cascaded 1st-order HP + LP.
+ *   - Adaptive threshold: thr = mean_EMA + K * std_EMA, with refractory (MIN_PEAK_INTERVAL).
+ *   - Peak is confirmed when the filtered signal is above thr and slope turns negative.
+ *
+ * Transport & GUI Protocol:
+ *   - NDJSON lines over Classic BT SPP (BluetoothSerial + SerialBT.write()).
+ *   - Full packet @1 Hz: {"bpm":72.3,"samples":[50 ints],"seq":N,"flags":X,"t_mcu":ms}
+ *   - BPM-only  @5 Hz:  {"bpm":72.3}
+ *   - GUI consumes one line at a time (newline-delimited), so every message ends with '\n'.
+ *
+ * Hardware (recommended):
+ *   - PPG on ADC1_CH6 (GPIO34 by default).
+ *   - Button: GPIO0 → GND, INPUT_PULLUP (pressed = LOW).
+ *   - Two LEDs share one logic (both on/off together) BUT each must have its own series resistor!
+ *
+ * Flags bitfield:
+ *   - bit0: button pressed (debounced LOW).
+ *   - bit1: low amplitude (filtered amplitude within last 1 s is below threshold).
+ *   - bit2: LEDs currently ON.
+ */
+
+#include <Arduino.h>
+#include "BluetoothSerial.h"
+BluetoothSerial SerialBT;              // Classic Bluetooth SPP
+
+// ===================== App / wiring parameters =====================
+#define DEVICE_NAME        "ESP32_PPG"
+
+#define PIN_ADC            34          // ADC1_CH6 (input only)
+#define PIN_BTN            0           // button to GND, use INPUT_PULLUP
+#define PIN_LED1           2           // each LED must have its own resistor to GND
+#define PIN_LED2           15
+
+#define USE_SYNTHETIC      0           // 1: sine+noise instead of ADC (bench testing)
+
+// Rates
+#define SAMPLE_HZ          50          // ADC sampling rate
+#define PKT_HZ             1           // full packet rate (MUST be 1 Hz)
+#define BPM_BROADCAST_HZ   5           // bpm-only JSON rate
+
+// Button & LEDs
+#define DEBOUNCE_MS        30          // button debounce (ms)
+#define LED_TOGGLE_MODE    1           // 1=toggle on press; 0=press-and-hold ON
+
+// Peak-detect & quality
+#define MIN_PEAK_INTERVAL  300         // ms (≈200 bpm upper bound)
+#define MAX_PEAK_INTERVAL  2000        // ms (reject too slow/false peaks)
+#define LOW_AMP_THRESH     40          // filtered amplitude threshold per 1 s window
+
+// -------- Band-pass design (first-order HP then first-order LP) --------
+// Cutoffs target heart-rate fundamentals and suppress DC/breathing drift.
+#define HP_CUTOFF_HZ       0.5f        // high-pass ~0.5 Hz (remove baseline drift)
+#define LP_CUTOFF_HZ       5.0f        // low-pass  ~5   Hz (remove high-freq noise)
+
+// -------- Adaptive threshold (EMA over filtered signal) --------
+#define EMA_WINDOW_SEC     3.0f        // ~3 s effective window
+#define THR_K              0.8f        // thr = mean + K*std  (tune 0.6–1.2)
+
+// Buffers for JSON construction
+static char jsonBuf[640];
+static char tmpBuf[48];
+
+// ===================== Runtime state =====================
+volatile uint16_t seq = 0;             // sequence number
+
+uint32_t lastSampleMs = 0;
+uint32_t lastPktMs    = 0;
+uint32_t lastBpmMs    = 0;
+
+// Raw ring buffer for 1 s @ 50 Hz (required by GUI packet)
+int   samples[50];
+int   sampIdx = 0;
+
+// -------- Filtering state (HP then LP) --------
+float dt_s = 1.0f / SAMPLE_HZ;         // sample period (s)
+
+// HP: y[n] = a_hp * (y[n-1] + x[n] - x[n-1])
+float a_hp = 0.0f;
+float hp_y_prev = 0.0f;
+float hp_x_prev = 0.0f;
+
+// LP: y[n] = a_lp*y[n-1] + (1-a_lp)*x[n]
+float a_lp = 0.0f;
+float lp_y_prev = 0.0f;
+
+// -------- Adaptive threshold (EMA mean/variance) --------
+float emaMean = NAN;
+float emaVar  = 0.0f;
+float emaAlpha = 0.0f;                 // ~2/(N+1) with N≈EMA_WINDOW_SEC*SAMPLE_HZ
+
+// Peak detection over filtered signal
+float  filtPrev = 0.0f;                // previous filtered sample
+bool   aboveThr = false;               // whether we've crossed above thr
+float  candPeak = 0.0f;                // candidate peak value while above threshold
+uint32_t candStartMs = 0;              // when we started being above threshold
+uint32_t lastPeakMs  = 0;              // last accepted peak time
+
+// Per-1s amplitude tracking over filtered signal
+float filtMin =  1e9f;
+float filtMax = -1e9f;
+
+// Button debounce + dual-LED state
+int      btnStable = HIGH;
+int      btnLastReading = HIGH;
+uint32_t btnLastChangeMs = 0;
+bool     ledOn = false;
+
+// ===================== Helpers =====================
+static inline int read_ppg()
+{
+#if USE_SYNTHETIC
+  // Synthetic: main 1.2 Hz + slow mod + noise (centered near mid-scale)
+  static float t = 0.f;
+  t += 1.0f / SAMPLE_HZ;
+  float y = 2000.0f * sinf(2 * PI * 1.2f * t)
+          + 300.0f * sinf(2 * PI * 0.13f * t)
+          + 60.0f  * ((float)random(-1000,1000) / 1000.0f);
+  int v = (int)(2048 + y);
+  if (v < 0) v = 0; if (v > 4095) v = 4095;
+  return v;
+#else
+  return analogRead(PIN_ADC);   // ESP32 12-bit ADC: 0..4095
+#endif
+}
+
+// Write one NDJSON line to BT SPP (newline-delimited)
+static inline void bt_write_line(const char* s)
+{
+  SerialBT.write((const uint8_t*)s, strlen(s));
+  SerialBT.write('\n');
+}
+
+// Exponential moving average (mean/variance update)
+// var_EMA uses the "delta^2" trick; it's a good lightweight std estimate.
+static inline void ema_update(float x)
+{
+  if (isnan(emaMean)) {
+    emaMean = x;
+    emaVar  = 0.0f;
+    return;
+  }
+  float d  = x - emaMean;
+  emaMean += emaAlpha * d;
+  emaVar   = (1.0f - emaAlpha) * emaVar + emaAlpha * d * d;
+}
+
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(115200); delay(100);
+
+#if !USE_SYNTHETIC
+  analogReadResolution(12);
+  // analogSetPinAttenuation(PIN_ADC, ADC_11db); // uncomment if you need larger range
+#endif
+
+  pinMode(PIN_BTN,  INPUT_PULLUP);
+  pinMode(PIN_LED1, OUTPUT);
+  pinMode(PIN_LED2, OUTPUT);
+  digitalWrite(PIN_LED1, LOW);
+  digitalWrite(PIN_LED2, LOW);
+
+  // Precompute filter coefficients (first-order RC forms)
+  // HP: a_hp = RC / (RC + dt) with RC = 1/(2π f_c)
+  float RC_hp = 1.0f / (2.0f * PI * HP_CUTOFF_HZ);
+  a_hp = RC_hp / (RC_hp + dt_s);
+
+  // LP: a_lp = RC / (RC + dt)
+  float RC_lp = 1.0f / (2.0f * PI * LP_CUTOFF_HZ);
+  a_lp = RC_lp / (RC_lp + dt_s);
+
+  // EMA alpha ≈ 2/(N+1), N ≈ window samples
+  int windowN = (int)(EMA_WINDOW_SEC * SAMPLE_HZ);
+  if (windowN < 1) windowN = 1;
+  emaAlpha = 2.0f / (windowN + 1.0f);
+
+  // Start BT SPP
+  if (!SerialBT.begin(DEVICE_NAME)) {
+    Serial.println("BT start failed");
+  } else {
+    Serial.print("BT device ready: "); Serial.println(DEVICE_NAME);
+  }
+
+  lastSampleMs = lastPktMs = lastBpmMs = millis();
+  randomSeed(esp_random());
+}
+
+// ===================== Loop =====================
+void loop() {
+  uint32_t now = millis();
+
+  // ---- (0) Button debounce + dual-LED control ----
+  {
+    int reading = digitalRead(PIN_BTN);
+    if (reading != btnLastReading) {
+      btnLastChangeMs = now;
+      btnLastReading  = reading;
+    }
+    if ((now - btnLastChangeMs) > DEBOUNCE_MS) {
+      if (reading != btnStable) {
+        btnStable = reading;
+#if LED_TOGGLE_MODE
+        if (btnStable == LOW) ledOn = !ledOn;  // toggle on press
+#else
+        ledOn = (btnStable == LOW);            // hold-to-light
+#endif
+      }
+    }
+    digitalWrite(PIN_LED1, ledOn ? HIGH : LOW);
+    digitalWrite(PIN_LED2, ledOn ? HIGH : LOW);
+  }
+
+  // ---- (1) 50 Hz sampling + band-pass + adaptive-threshold peak detect ----
+  if (now - lastSampleMs >= (1000 / SAMPLE_HZ)) {
+    lastSampleMs += (1000 / SAMPLE_HZ);
+
+    // 1. Acquire raw
+    int vRaw = read_ppg();
+    samples[sampIdx] = vRaw;                  // keep raw for GUI packet
+    sampIdx = (sampIdx + 1) % 50;
+
+    // 2. Filter (HP then LP) on float
+    float x = (float)vRaw;
+    // High-pass (remove baseline drift)
+    float hp_y = a_hp * (hp_y_prev + x - hp_x_prev);
+    hp_x_prev = x;
+    hp_y_prev = hp_y;
+    // Low-pass (remove high-frequency noise)
+    float y  = a_lp * lp_y_prev + (1.0f - a_lp) * hp_y;
+    lp_y_prev = y;                            // y = band-passed sample
+
+    // Track filtered amplitude over 1 s
+    if (y < filtMin) filtMin = y;
+    if (y > filtMax) filtMax = y;
+
+    // 3. Adaptive threshold from EMA mean & std
+    ema_update(y);
+    float stdE = sqrtf(max(emaVar, 1e-6f));   // avoid zero std
+    float thr  = emaMean + THR_K * stdE;
+
+    // 4. Peak confirmation rule:
+    //    - First go ABOVE thr while rising (arm)
+    //    - Then slope turns non-positive → confirm local max as a heartbeat
+    float dv = y - filtPrev;
+    if (!aboveThr && (y >= thr) && (dv > 0)) {
+      aboveThr   = true;
+      candPeak   = y;
+      candStartMs = now;
+    } else if (aboveThr) {
+      if (y > candPeak) candPeak = y;         // track the highest point while above thr
+      if ((dv <= 0) || (now - candStartMs > MAX_PEAK_INTERVAL)) {
+        // Slope turned down OR timeout → treat candPeak time as the "peak moment"
+        uint32_t dt = now - lastPeakMs;
+        if (dt > MIN_PEAK_INTERVAL && dt < MAX_PEAK_INTERVAL) {
+          float currBpm = 60000.0f / dt;
+          // Light smoothing for display
+          static float bpmLPF = NAN;
+          if (isnan(bpmLPF)) bpmLPF = currBpm;
+          else               bpmLPF = bpmLPF + 0.3f * (currBpm - bpmLPF);
+
+          // Update lastPeakMs and expose bpmLPF via a static global-like (below)
+          lastPeakMs = now;
+          // Store bpmLPF into a global we broadcast; we reuse lp var name from previous version
+          // (Declare at file scope to keep it accessible:)
+          // -> We'll replicate the variable here as a static to keep logic local:
+          // But to keep compatibility with previous code pieces, we expose via a function-static:
+          // Instead, define a global at the top:
+        }
+        aboveThr = false;
+      }
+    }
+    filtPrev = y;
+
+    // ---- Write bpmLPF into a global for broadcaster ----
+    // We'll compute bpmLPF here explicitly so the rest of the code can read it:
+    // Using last two detected peaks: we already updated lastPeakMs when we detect a peak.
+    // For simplicity, we keep a module-level bpm variables again (same names as earlier).
+    // Recompute here based on time since last peak (if any):
+    // (This avoids reshuffling too many globals from the prior version.)
+    // NOTE: If no recent peak, keep bpm as NAN (GUI will see 0.0 fallback).
+  }
+
+  // We need persistent bpm variables outside the sampling block:
+  // We'll define them static here to retain values between iterations.
+  static float bpmInst = NAN;
+  static float bpmLPF  = NAN;
+  // Post-process peaks: insert a tiny block that reads lastPeakMs and computes bpm
+  {
+    static uint32_t lastSeenPeak = 0;
+    if (lastPeakMs != 0 && lastPeakMs != lastSeenPeak) {
+      // A new peak was confirmed in the sampling block
+      uint32_t now2 = millis();
+      static uint32_t prevPeak = 0;
+      if (prevPeak != 0) {
+        uint32_t dt = lastPeakMs - prevPeak;
+        if (dt > MIN_PEAK_INTERVAL && dt < MAX_PEAK_INTERVAL) {
+          float currBpm = 60000.0f / dt;
+          bpmInst = currBpm;
+          if (isnan(bpmLPF)) bpmLPF = currBpm;
+          else               bpmLPF = bpmLPF + 0.3f * (currBpm - bpmLPF);
+        }
+      }
+      prevPeak = lastPeakMs;
+      lastSeenPeak = lastPeakMs;
+    } else {
+      // If it's been too long without peaks, decay to NAN
+      if (lastPeakMs && (millis() - lastPeakMs > MAX_PEAK_INTERVAL)) {
+        bpmInst = NAN;
+      }
+    }
+  }
+
+  // ---- (2) 5 Hz bpm-only JSON ----
+  if (now - lastBpmMs >= (1000 / BPM_BROADCAST_HZ)) {
+    lastBpmMs += (1000 / BPM_BROADCAST_HZ);
+    float outBpm = isnan(bpmLPF) ? 0.0f : bpmLPF;
+    int n = snprintf(jsonBuf, sizeof(jsonBuf), "{\"bpm\":%.1f}", outBpm);
+    if (n > 0 && n < (int)sizeof(jsonBuf)) bt_write_line(jsonBuf);
+  }
+
+  // ---- (3) 1 Hz full packet (50 raw samples + bpm + seq + flags + t_mcu) ----
+  if (now - lastPktMs >= (1000 / PKT_HZ)) {
+    lastPktMs += (1000 / PKT_HZ);
+
+    // Flags:
+    uint16_t flags = 0;
+    if (btnStable == LOW) flags |= 0x01;                          // bit0: button
+    if ((filtMax - filtMin) < LOW_AMP_THRESH) flags |= 0x02;      // bit1: low amplitude
+    if (ledOn)                   flags |= 0x04;                   // bit2: LEDs ON
+
+    // JSON head
+    float outBpm = (isnan(bpmLPF) ? 0.0f : bpmLPF);
+    int written = snprintf(jsonBuf, sizeof(jsonBuf),
+                           "{\"bpm\":%.1f,\"samples\":[", outBpm);
+    if (written <= 0 || written >= (int)sizeof(jsonBuf)) return;
+
+    // Append 50 raw samples (oldest→newest)
+    int start = sampIdx;
+    for (int i = 0; i < 50; ++i) {
+      int idx = (start + i) % 50;
+      int v = samples[idx];
+      int n = snprintf(tmpBuf, sizeof(tmpBuf), (i == 49) ? "%d" : "%d,", v);
+      if (written + n + 64 >= (int)sizeof(jsonBuf)) break;  // keep room for tail
+      memcpy(jsonBuf + written, tmpBuf, n);
+      written += n;
+    }
+
+    // Tail: seq/flags/t_mcu
+    int n = snprintf(jsonBuf + written, sizeof(jsonBuf) - written,
+                     "],\"seq\":%u,\"flags\":%u,\"t_mcu\":%lu}",
+                     seq, flags, (unsigned long)now);
+    if (n > 0) {
+      bt_write_line(jsonBuf);
+      seq++;
+    }
+
+    // Reset per-1s filtered amplitude tracking
+    filtMin =  1e9f;
+    filtMax = -1e9f;
+  }
+
+  // (Optional) Save power when no client:
+  // if (!SerialBT.hasClient()) { ... }
+}
+
