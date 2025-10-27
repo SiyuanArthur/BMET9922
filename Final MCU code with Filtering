@@ -7,202 +7,211 @@
  *   - REC LED on only when recording
  *   - Button toggles recording (debounced)
  */
-#include <Arduino.h>
-#include "BluetoothSerial.h"
+#include <Arduino.h>                            // Include Arduino core functions
+#include "BluetoothSerial.h"                    // Include ESP32 Bluetooth Serial library
 
-BluetoothSerial SerialBT;
+BluetoothSerial SerialBT;                      // Create Bluetooth Serial object
 
 // ============ Hardware pins ============
-#define PIN_ADC     26      // Pulse sensor analog input
-#define PIN_BTN     35      // Button input 
-#define PIN_LED_BT  33      // Bluetooth status LED
-#define PIN_LED_REC 32      // Recording status LED
+#define PIN_ADC     26                         // Analog pin for pulse sensor signal input
+#define PIN_BTN     35                         // Button input pin, wired to GND with pull-up
+#define PIN_LED_BT  33                         // Bluetooth status LED output pin
+#define PIN_LED_REC 32                         // Recording status LED output pin
 
-#define DEVICE_NAME "ESP32_PPG"
+#define DEVICE_NAME "ESP32_PPG"                // Bluetooth device advertised name
 
 // ========== Signal processing ========== 
-#define SAMPLE_HZ        50
-#define PKT_HZ           1
-#define BPM_BROADCAST_HZ 5
-#define DEBOUNCE_MS      30
-#define MIN_PEAK_INTERVAL  300
-#define MAX_PEAK_INTERVAL  2000
-#define HP_CUTOFF_HZ     0.3f
-#define LP_CUTOFF_HZ     5.0f
-#define EMA_WINDOW_SEC   5.0f
-#define THR_K            1.0f
-#define LOW_AMP_THRESH   40
+#define SAMPLE_HZ        50                     // Sampling frequency: 50 samples per second
+#define PKT_HZ           1                      // Packet sending rate for full data: 1 Hz (once per second)
+#define BPM_BROADCAST_HZ 5                      // BPM-only update rate: 5 Hz
+#define DEBOUNCE_MS      30                     // Button debounce duration in milliseconds
+#define MIN_PEAK_INTERVAL 300                   // Minimum interval between peaks (ms) ~200 bpm max
+#define MAX_PEAK_INTERVAL 2000                  // Maximum interval between peaks (ms) ~30 bpm min
+#define HP_CUTOFF_HZ     0.3f                   // High-pass filter cutoff frequency (Hz)
+#define LP_CUTOFF_HZ     5.0f                   // Low-pass filter cutoff frequency (Hz)
+#define EMA_WINDOW_SEC   5.0f                   // EMA window length (seconds) for adaptive threshold
+#define THR_K            1.0f                   // Threshold scaling factor for peak detection
+#define LOW_AMP_THRESH   40                     // Threshold for low signal amplitude check
 
-static char jsonBuf[640], tmpBuf[48];
-volatile uint16_t seq = 0;
-uint32_t lastSampleMs = 0, lastPktMs = 0, lastBpmMs = 0;
-int samples[50], sampIdx = 0;
+static char jsonBuf[640], tmpBuf[48];          // Buffers for composing BT JSON packets
+volatile uint16_t seq = 0;                      // Sequence number for outgoing packets
+uint32_t lastSampleMs = 0, lastPktMs = 0, lastBpmMs = 0;  // Time trackers for sampling and sending packets
+int samples[50], sampIdx = 0;                   // Circular buffer of last 50 samples (~1 second of data)
 
-// Filtering state
-float dt_s = 1.0f / SAMPLE_HZ, a_hp = 0.0f, hp_y_prev = 0.0f, hp_x_prev = 0.0f;
-float a_lp = 0.0f, lp_y_prev = 0.0f;
+// Filtering state variables
+float dt_s = 1.0f / SAMPLE_HZ;                  // Sampling period in seconds
+float a_hp = 0.0f, hp_y_prev = 0.0f, hp_x_prev = 0.0f;    // High-pass filter coefficient and previous values
+float a_lp = 0.0f, lp_y_prev = 0.0f;            // Low-pass filter coefficient and previous filtered output
 
-// EMA state
-float emaMean = NAN, emaVar = 0.0f, emaAlpha = 0.0f;
+// EMA state for adaptive thresholding
+float emaMean = NAN, emaVar = 0.0f, emaAlpha = 0.0f;  
 
-// Beat detection
-float filtPrev = 0.0f; bool aboveThr = false;
-float candPeak = 0.0f; uint32_t candStartMs = 0, lastPeakMs = 0;
-float filtMin =  1e9f, filtMax = -1e9f;
+// Beat detection state variables
+float filtPrev = 0.0f; bool aboveThr = false;   // Previous filtered value, and flag to indicate above threshold
+float candPeak = 0.0f; uint32_t candStartMs = 0, lastPeakMs = 0;  // Candidate peak amplitude and timing, last detected peak time
+float filtMin =  1e9f, filtMax = -1e9f;         // Min/max filtered value tracking for amplitude check
 
-// Button, LED, and recording state
-int btnStable = HIGH, btnLastReading = HIGH;
-uint32_t btnLastChangeMs = 0;
-bool recording = false;
+// Button debounce and recording state
+int btnStable = HIGH, btnLastReading = HIGH;    // Debounced stable button value and last raw reading
+uint32_t btnLastChangeMs = 0;                    // Timestamp of last button state change
+bool recording = false;                           // Recording enabled flag
 
-// Min/max adaptive threshold for plotting
-static int runningMin = 4095, runningMax = 0;
+// Adaptive thresholding for serial plotting
+static int runningMin = 4095, runningMax = 0;   // Min and max raw ADC values for adaptive threshold visualization
 
-// Helper: Read pulse sensor value
+// Helper: Read pulse sensor analog value
 static inline int read_ppg() { return analogRead(PIN_ADC); }
 
-// Helper: Write NDJSON to Bluetooth SPP
+// Helper: Send NDJSON line over Bluetooth SPP
 static inline void bt_write_line(const char* s) {
-  SerialBT.write((const uint8_t*)s, strlen(s));
-  SerialBT.write('\n');
+  SerialBT.write((const uint8_t*)s, strlen(s));  // Send string bytes
+  SerialBT.write('\n');                           // Send newline character
 }
 
-// Helper: Update EMA mean/variance
+// Helper: Update EMA mean and variance with new sample
 static inline void ema_update(float x) {
-  if (isnan(emaMean)) { emaMean = x; emaVar = 0.0f; return; }
-  float d = x - emaMean;
-  emaMean += emaAlpha * d;
-  emaVar   = (1.0f - emaAlpha) * emaVar + emaAlpha * d * d;
+  if (isnan(emaMean)) {                           // Initialize mean/variance on first call
+    emaMean = x; 
+    emaVar = 0.0f; 
+    return; 
+  }
+  float d = x - emaMean;                          // Difference from current mean
+  emaMean += emaAlpha * d;                        // Update mean
+  emaVar   = (1.0f - emaAlpha) * emaVar + emaAlpha * d * d;  // Update variance
 }
 
 void setup() {
-  Serial.begin(115200);
-  analogReadResolution(12);    // 12-bit ADC range
-  analogSetAttenuation(ADC_11db); // Wide voltage input
+  Serial.begin(115200);                           // Initialize serial for debug and plotter output
+  analogReadResolution(12);                       // Set ADC to 12-bit resolution (0-4095 range)
+  analogSetAttenuation(ADC_11db);                 // ADC input attenuation for wider voltage range
 
-  pinMode(PIN_BTN,     INPUT_PULLUP);
-  pinMode(PIN_LED_BT,  OUTPUT);
-  pinMode(PIN_LED_REC, OUTPUT);
-  digitalWrite(PIN_LED_BT, LOW);
-  digitalWrite(PIN_LED_REC, LOW);
+  pinMode(PIN_BTN,     INPUT_PULLUP);             // Configure button pin with pull-up
+  pinMode(PIN_LED_BT,  OUTPUT);                    // Configure Bluetooth LED pin as output
+  pinMode(PIN_LED_REC, OUTPUT);                    // Configure recording LED pin as output
+  digitalWrite(PIN_LED_BT, LOW);                   // Turn off BT LED initially
+  digitalWrite(PIN_LED_REC, LOW);                  // Turn off REC LED initially
 
-  float RC_hp = 1.0f / (2.0f * PI * HP_CUTOFF_HZ);
-  a_hp = RC_hp / (RC_hp + dt_s);
+  float RC_hp = 1.0f / (2.0f * PI * HP_CUTOFF_HZ);  // Time constant of high-pass filter
+  a_hp = RC_hp / (RC_hp + dt_s);                    // HP filter smoothing factor (single-pole)
 
-  float RC_lp = 1.0f / (2.0f * PI * LP_CUTOFF_HZ);
-  a_lp = RC_lp / (RC_lp + dt_s);
+  float RC_lp = 1.0f / (2.0f * PI * LP_CUTOFF_HZ);  // Time constant of low-pass filter
+  a_lp = RC_lp / (RC_lp + dt_s);                     // LP filter smoothing factor
 
-  int windowN = (int)(EMA_WINDOW_SEC * SAMPLE_HZ);
-  if (windowN < 1) windowN = 1;
-  emaAlpha = 2.0f / (windowN + 1.0f);
+  int windowN = (int)(EMA_WINDOW_SEC * SAMPLE_HZ);  // Number of samples in EMA window
+  if (windowN < 1) windowN = 1;                      // Prevent division by zero
+  emaAlpha = 2.0f / (windowN + 1.0f);                // EMA alpha factor (smoothing factor)
 
-  if (!SerialBT.begin(DEVICE_NAME))
+  if (!SerialBT.begin(DEVICE_NAME))                   // Initialize Bluetooth SPP server with device name
     Serial.println("BT failed to connect.");
   else
     Serial.print("BT ready: "), Serial.println(DEVICE_NAME);
 
-  lastSampleMs = lastPktMs = lastBpmMs = millis();
-  randomSeed(esp_random());
+  lastSampleMs = lastPktMs = lastBpmMs = millis();     // Initialize timing variables
+  randomSeed(esp_random());                             // Seed randomness for potential jitter/randomness
 }
 
 void loop() {
-  uint32_t now = millis();
+  uint32_t now = millis();                              // Current time in milliseconds
 
   // --- Button debounce and recording toggle logic ---
-  int reading = digitalRead(PIN_BTN);
-  if (reading != btnLastReading) {
-    btnLastChangeMs = now;
-    btnLastReading  = reading;
+  int reading = digitalRead(PIN_BTN);                   // Read raw button state
+  if (reading != btnLastReading) {                      // If button state changed
+    btnLastChangeMs = now;                               // Update time of change
+    btnLastReading  = reading;                           // Update last reading
   }
-  if ((now - btnLastChangeMs) > DEBOUNCE_MS) {
-    if (reading != btnStable) {
-      btnStable = reading;
-      if (btnStable == LOW) // Active low
-        recording = !recording;
+  if ((now - btnLastChangeMs) > DEBOUNCE_MS) {          // If stable for debounce period
+    if (reading != btnStable) {                          // If different from stable state
+      btnStable = reading;                               // Update stable state
+      if (btnStable == LOW)                              // Button pressed (active low)
+        recording = !recording;                          // Toggle recording state
     }
   }
 
   // --- Bluetooth LED logic: blink if not connected, solid when connected ---
-  if (SerialBT.hasClient()) {
-    digitalWrite(PIN_LED_BT, HIGH);
-  } else {
-    static uint32_t lastBlink = 0; static bool blinkState = false;
-    if (millis() - lastBlink > 500) {
+  if (SerialBT.hasClient()) {                            // If BT client connected
+    digitalWrite(PIN_LED_BT, HIGH);                      // Solid ON
+  } else {                                               // Else disconnected
+    static uint32_t lastBlink = 0; 
+    static bool blinkState = false;
+    if (millis() - lastBlink > 500) {                    // Blink every 500 ms
       lastBlink = millis();
       blinkState = !blinkState;
       digitalWrite(PIN_LED_BT, blinkState ? HIGH : LOW);
     }
   }
+
   // --- REC LED logic: ON only when recording (solid), OFF otherwise ---
   digitalWrite(PIN_LED_REC, recording ? LOW : HIGH);
 
   // === Signal processing and sampling ===
-  if (now - lastSampleMs >= (1000 / SAMPLE_HZ)) {
-    lastSampleMs += (1000 / SAMPLE_HZ);
+  if (now - lastSampleMs >= (1000 / SAMPLE_HZ)) {       // Time to sample a new PPG reading
+    lastSampleMs += (1000 / SAMPLE_HZ);                  // Update sampling time
 
-    int vRaw = read_ppg();
-    samples[sampIdx] = vRaw;
-    sampIdx = (sampIdx + 1) % 50;
+    int vRaw = read_ppg();                               // Read raw analog value from sensor
+    samples[sampIdx] = vRaw;                             // Store sample in circular buffer
+    sampIdx = (sampIdx + 1) % 50;                        // Update buffer index (wrap around at 50)
 
-    // Band-pass filtering (HP then LP)
+    // Band-pass filtering (High-pass then Low-pass)
     float x = (float)vRaw;
-    float hp_y = a_hp * (hp_y_prev + x - hp_x_prev);
+    float hp_y = a_hp * (hp_y_prev + x - hp_x_prev);     // HPF: remove baseline wander
     hp_x_prev = x; hp_y_prev = hp_y;
-    float y = a_lp * lp_y_prev + (1.0f - a_lp) * hp_y;
+    float y = a_lp * lp_y_prev + (1.0f - a_lp) * hp_y;   // LPF: smooth high-frequency noise
     lp_y_prev = y;
 
-    // For amplitude over 1 sec
+    // Track amplitude min/max for peak detection
     if (y < filtMin) filtMin = y;
     if (y > filtMax) filtMax = y;
 
-    // --- Min/max threshold calculation for Serial Plotter (visual only) ---
+    // --- Min/max threshold calculation for Serial Plotter (visual only for debugging) ---
     if (vRaw < runningMin) runningMin = vRaw;
     if (vRaw > runningMax) runningMax = vRaw;
     int thresholdRaw = (int)(runningMin * 0.4 + runningMax * 0.6);
 
-    // Serial Plotter output (raw signal, min/max adaptive threshold)
+    // Output raw and adaptive threshold to Serial Plotter (for live visualization)
     Serial.print(vRaw);
     Serial.print(",");
     Serial.println(thresholdRaw);
 
-    // --- Reset min/max every second ---
-    if (sampIdx == 0) { // Every 50 samples (approx 1s)
+    // Reset min/max every second (50 samples)
+    if (sampIdx == 0) {
       runningMin = 4095;
       runningMax = 0;
     }
 
-    // --- Advanced threshold and peak detection (filtered, for BPM only) ---
-    ema_update(y);
-    float stdE = sqrtf(max(emaVar, 1e-6f));
-    float thr  = emaMean + THR_K * stdE;
-
-    float dv = y - filtPrev;
-    if (!aboveThr && (y >= thr) && (dv > 0)) {
-      aboveThr = true, candPeak = y, candStartMs = now;
-    } else if (aboveThr) {
-      if (y > candPeak) candPeak = y;
-      if ((dv <= 0) || (now - candStartMs > MAX_PEAK_INTERVAL)) {
-        uint32_t dt = now - lastPeakMs;
-        if (dt > MIN_PEAK_INTERVAL && dt < MAX_PEAK_INTERVAL) {
-          float currBpm = 60000.0f / dt;
+    // Advanced threshold and peak detection for BPM calculation
+    ema_update(y);                                                // Update EMA mean/variance with filtered sample
+    float stdE = sqrtf(max(emaVar, 1e-6f));                      // Calculate robust standard deviation
+    float thr  = emaMean + THR_K * stdE;                         // Adaptive threshold for peak detection
+    
+    float dv = y - filtPrev;                                      // Signal derivative (change)
+    if (!aboveThr && (y >= thr) && (dv > 0)) {                   // Rising edge crossing threshold
+      aboveThr = true; 
+      candPeak = y; 
+      candStartMs = now;                                          // Candidate peak start
+    } else if (aboveThr) {                                        // Already above threshold
+      if (y > candPeak) candPeak = y;                            // Track maximum in peak region
+      if ((dv <= 0) || (now - candStartMs > MAX_PEAK_INTERVAL)) {// Peak ended or timeout
+        uint32_t dt = now - lastPeakMs;                          // Interval since last peak
+        if (dt > MIN_PEAK_INTERVAL && dt < MAX_PEAK_INTERVAL) { // Check physiological range
+          float currBpm = 60000.0f / dt;                         // Calculate instantaneous BPM
           static float bpmLPF = NAN;
-          if (isnan(bpmLPF)) bpmLPF = currBpm;
-          else bpmLPF = bpmLPF + 0.3f * (currBpm - bpmLPF);
-          lastPeakMs = now;
+          if (isnan(bpmLPF)) bpmLPF = currBpm;                   // Initialize BPM low-pass filter
+          else bpmLPF = bpmLPF + 0.3f * (currBpm - bpmLPF);      // Smooth BPM over time
+          lastPeakMs = now;                                       // Update last peak time
         }
-        aboveThr = false;
+        aboveThr = false;                                         // End peak detection phase
       }
     }
-    filtPrev = y;
+    filtPrev = y;                                                 // Store filtered value for next iteration
   }
 
   // --- BPM state for broadcasting ---
   static float bpmInst = NAN, bpmLPF = NAN;
   {
     static uint32_t lastSeenPeak = 0, prevPeak = 0;
-    if (lastPeakMs != 0 && lastPeakMs != lastSeenPeak) {
+    if (lastPeakMs != 0 && lastPeakMs != lastSeenPeak) {       // New peak detected
       if (prevPeak != 0) {
-        uint32_t dt = lastPeakMs - prevPeak;
+        uint32_t dt = lastPeakMs - prevPeak;                   // Interval between peaks
         if (dt > MIN_PEAK_INTERVAL && dt < MAX_PEAK_INTERVAL) {
           float currBpm = 60000.0f / dt;
           bpmInst = currBpm;
@@ -210,44 +219,48 @@ void loop() {
           else bpmLPF = bpmLPF + 0.3f * (currBpm - bpmLPF);
         }
       }
-      prevPeak = lastPeakMs;
-      lastSeenPeak = lastPeakMs;
+      prevPeak = lastPeakMs;                                   // Update previous peak time
+      lastSeenPeak = lastPeakMs;                               // Mark last peak as processed
     } else if (lastPeakMs && (millis() - lastPeakMs > MAX_PEAK_INTERVAL)) {
-      bpmInst = NAN;
+      bpmInst = NAN;                                           // Reset BPM if no peak in max interval
     }
   }
 
-  // --- 5 Hz NDJSON BPM-only ---
-  if (now - lastBpmMs >= (1000 / BPM_BROADCAST_HZ)) {
+  // --- Send simple BPM NDJSON packet at 5 Hz ---
+  if (recording && (now - lastBpmMs >= (1000 / BPM_BROADCAST_HZ))) {
     lastBpmMs += (1000 / BPM_BROADCAST_HZ);
     float outBpm = isnan(bpmLPF) ? 0.0f : bpmLPF;
     int n = snprintf(jsonBuf, sizeof(jsonBuf), "{\"bpm\":%.1f}", outBpm);
-    if (n > 0 && n < (int)sizeof(jsonBuf)) bt_write_line(jsonBuf);
+    if (n > 0 && n < (int)sizeof(jsonBuf)) 
+      bt_write_line(jsonBuf);                                 // Send BPM-only packet
   }
 
-  // --- 1 Hz NDJSON full packet ---
-  if (now - lastPktMs >= (1000 / PKT_HZ)) {
+  // --- Send full NDJSON packet at 1 Hz with samples and status flags ---
+  if (recording && (now - lastPktMs >= (1000 / PKT_HZ))) {
     lastPktMs += (1000 / PKT_HZ);
     uint16_t flags = 0;
-    if (btnStable == LOW)                  flags |= 0x01; // Button pressed
-    if ((filtMax - filtMin) < LOW_AMP_THRESH) flags |= 0x02; // Low amplitude
-    if (recording)                         flags |= 0x04; // REC LED status
-
-    float outBpm = isnan(bpmLPF) ? 0.0f : bpmLPF;
+    if (btnStable == LOW)                 flags |= 0x01;      // Flag if button pressed
+    if ((filtMax - filtMin) < LOW_AMP_THRESH) flags |= 0x02; // Flag if low amplitude signal
+    if (recording)                       flags |= 0x04;      // Flag if recording
+    
+    float outBpm = isnan(bpmLPF) ? 0.0f : bpmLPF;     //checks if the BPM is not a number and sets outBpm to 0
     int written = snprintf(jsonBuf, sizeof(jsonBuf), "{\"bpm\":%.1f,\"samples\":[", outBpm);
-    if (written <= 0 || written >= (int)sizeof(jsonBuf)) return;
-
+    if (written <= 0 || written >= (int)sizeof(jsonBuf)) return;    //composes the JSON-formatted strong into a character buffer jsonbuf, forming the BT packet
+  
     int start = sampIdx;
-    for (int i = 0; i < 50; ++i) {
+    for (int i = 0; i < 50; ++i) {                             // Include last 50 samples in JSON array
       int idx = (start + i) % 50;
       int v = samples[idx];
       int n = snprintf(tmpBuf, sizeof(tmpBuf), (i == 49) ? "%d" : "%d,", v);
-      if (written + n + 64 >= (int)sizeof(jsonBuf)) break;
+      if (written + n + 64 >= (int)sizeof(jsonBuf)) break;    // Ensure buffer has space
       memcpy(jsonBuf + written, tmpBuf, n);
       written += n;
     }
     int n = snprintf(jsonBuf + written, sizeof(jsonBuf) - written, "],\"seq\":%u,\"flags\":%u,\"t_mcu\":%lu}", seq, flags, (unsigned long)now);
-    if (n > 0) { bt_write_line(jsonBuf); seq++; }
-    filtMin =  1e9f; filtMax = -1e9f;
+    if (n > 0) {
+      bt_write_line(jsonBuf);                                  // Send full packet to BT
+      seq++;                                                  // Increment packet sequence
+    }
+    filtMin =  1e9f; filtMax = -1e9f;                         // Reset min/max for next interval
   }
 }
