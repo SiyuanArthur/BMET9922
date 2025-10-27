@@ -1,52 +1,45 @@
 #include "BluetoothSerial.h"
 #include <Esp.h>
-
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run menuconfig to enable it
-#endif
+#include "switch.h"
 
 BluetoothSerial SerialBT;
 
-// Hardware config
-#define PULSE_SENSOR_PIN  25
-#define BUTTON_PIN        33
-#define LED_BT            32   // Bluetooth status LED
-#define LED_REC           27   // Recording status LED
-#define DEBOUNCE_COUNT    5
-#define SAMPLE_PERIOD_MS  20   // 50 samples/s
+// --- Hardware config ---
+#define PULSE_SENSOR_PIN  26
+#define BUTTON_PIN        35
+#define LED_BT            33  // Bluetooth status LED 
+#define LED_REC           32  // Recording status LED 
+#define SAMPLE_PERIOD_MS  20  // 50 samples/s
 
-// Signal variables
+// --- Logic variables ---
+volatile bool isConnected = false;
+String btName = "ESP32_PulseDevice";
+bool recording = false;
+
 unsigned long lastSampleTime = 0;
-int sampleBuffer[200];        // Buffer for min/max adaptation
+int sampleBuffer[200];
 int sampleIndex = 0;
-bool buttonState = false;
-bool lastButtonReading = false;
-int debounceCounter = 0;
 float bpm = 0;
 int threshold = 0;
 unsigned long lastBeatTime = 0;
 int beatCount = 0;
 
-// Bluetooth and logic
-volatile bool isConnected = false;
-String btName = "ESP32_PulseDevice";
-bool recording = false;
+// --- Debounced Switch for Recording Button ---
+Switch recordBtn(0, 5); // id = 0, threshold = 5 
 
-// LED blink timers
+// --- LED timers (BT LED blinks when not connected) ---
 unsigned long ledBtTimer = 0;
 const unsigned long ledBtBlinkInterval = 500;
-unsigned long ledRecTimer = 0;
-const unsigned long ledRecBlinkInterval = 200;
 
-// Bluetooth callback
+// --- Bluetooth callback ---
 void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
   if (event == ESP_SPP_SRV_OPEN_EVT) {
     isConnected = true;
-    Serial.println("Client Connected!");
+    Serial.println("BT Connected");
   } 
   else if (event == ESP_SPP_CLOSE_EVT) {
     isConnected = false;
-    Serial.println("Client Disconnected!");
+    Serial.println("BT Disconnected");
   } 
   else {
     Serial.print("BT Event: ");
@@ -60,17 +53,11 @@ void setup() {
   pinMode(LED_BT, OUTPUT);
   pinMode(LED_REC, OUTPUT);
 
-  // Set ADC attenuation for best full-scale accuracy (recommended for ESP32)
+  // Set ADC attenuation for pulse sensor
   analogSetAttenuation(ADC_11db);
 
-  Serial.println("Initializing Bluetooth...");
   SerialBT.register_callback(btCallback);
-  if (!SerialBT.begin(btName)) {
-    Serial.println("Error initializing Bluetooth!");
-  } else {
-    Serial.print("Bluetooth initialized as: ");
-    Serial.println(btName);
-  }
+  SerialBT.begin(btName);
 
   Serial.println("PPG,Threshold");
 }
@@ -78,37 +65,29 @@ void setup() {
 void loop() {
   unsigned long currTime = millis();
 
-  // 1. Sample every 20ms
+  // --- Sample pulse sensor every 20ms ---
   if (currTime - lastSampleTime >= SAMPLE_PERIOD_MS) {
     lastSampleTime = currTime;
 
     int sensorValue = analogRead(PULSE_SENSOR_PIN); // NO FILTERING
     sampleBuffer[sampleIndex++] = sensorValue;
 
-    // Button debounce and edge detection for toggling recording
-    bool currentReading = !digitalRead(BUTTON_PIN); // Active LOW
-    if (currentReading != lastButtonReading) {
-      debounceCounter = 0;
-    } else if (debounceCounter < DEBOUNCE_COUNT) {
-      debounceCounter++;
-      if (debounceCounter >= DEBOUNCE_COUNT && currentReading && !buttonState) {
-        recording = !recording;
-        Serial.printf("Recording:%d\n", recording ? 1 : 0);
-        SerialBT.printf("Recording:%d\n", recording ? 1 : 0);
-        buttonState = true;
-      }
+    // Use Switch class for button debounce and "edge-detect" logic
+    bool physicalBtn = !digitalRead(BUTTON_PIN); // Active LOW
+    if (recordBtn.update(physicalBtn) && recordBtn.state()) {
+      // Button transitioned (pressed after stable threshold)
+      recording = !recording;
+      Serial.printf("Recording:%d\n", recording ? 1 : 0);
+      SerialBT.printf("Recording:%d\n", recording ? 1 : 0);
     }
-    if (!currentReading) buttonState = false;
-    lastButtonReading = currentReading;
 
-    // Adaptive threshold using buffer period longer for robustness
+    // Adaptive threshold (min/max adaptation)
     static int runningMin = 4095, runningMax = 0;
     if (sensorValue < runningMin) runningMin = sensorValue;
     if (sensorValue > runningMax) runningMax = sensorValue;
-
     threshold = (runningMin * 0.4 + runningMax * 0.6);
 
-    // Rising edge beat detection
+    // Pulse detection (rising edge)
     static bool lastAbove = false;
     bool aboveThreshold = (sensorValue > threshold);
     if (!lastAbove && aboveThreshold) {
@@ -126,13 +105,11 @@ void loop() {
     Serial.print(",");
     Serial.println(threshold);
 
-    // Data packet every ~4s (200 samples) for smarter min/max adaptation
+    // Send buffer every 200 samples
     if (sampleIndex >= 200) {
-      if (isConnected) {
-        sendSerialPacket(200);
-      } else {
-        Serial.println("Waiting for Bluetooth connection...");
-      }
+      if (isConnected) sendSerialPacket(200);
+      else Serial.println("Waiting for Bluetooth connection...");
+
       sampleIndex = 0;
       runningMin = 4095;
       runningMax = 0;
@@ -140,25 +117,15 @@ void loop() {
     }
   }
 
-  // Bluetooth status LED
-  if (isConnected) {
-    digitalWrite(LED_BT, HIGH);
-  } else {
-    if (millis() - ledBtTimer >= ledBtBlinkInterval) {
-      ledBtTimer = millis();
-      digitalWrite(LED_BT, !digitalRead(LED_BT));
-    }
+  // --- Bluetooth status LED ---
+  if (isConnected) digitalWrite(LED_BT, HIGH);
+  else if (millis() - ledBtTimer >= ledBtBlinkInterval) {
+    ledBtTimer = millis();
+    digitalWrite(LED_BT, !digitalRead(LED_BT));
   }
 
-  // Recording status LED
-  if (recording) {
-    digitalWrite(LED_REC, HIGH);
-  } else {
-    if (millis() - ledRecTimer >= ledRecBlinkInterval) {
-      ledRecTimer = millis();
-      digitalWrite(LED_REC, !digitalRead(LED_REC));
-    }
-  }
+  // --- REC LED logic (only FULL ON when recording active) ---
+  digitalWrite(LED_REC, recording ? LOW : HIGH);
 }
 
 void sendSerialPacket(int bufsize) {
@@ -175,11 +142,11 @@ void sendSerialPacket(int bufsize) {
   Serial.println(recording ? "1" : "0");
 
   if (isConnected) {
-    SerialBT.printf("BPM:%.1f Data:", bpm);
+    SerialBT.printf("{\"BPM\":%.1f, \"Data:\":[", bpm);
     for (int i = 0; i < bufsize; i++) {
       SerialBT.printf("%d,", sampleBuffer[i]);
+      if (i < bufsize - 1) SerialBT.printf(",");
     }
-    SerialBT.printf(" Threshold:%d Button:%d\n", threshold, recording ? 1 : 0);
+    SerialBT.printf(" Threshold:%d Recording: %s\n", threshold, recording ? "1" : "0");
   }
 }
-
