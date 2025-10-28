@@ -32,6 +32,10 @@ BluetoothSerial SerialBT;                     // Instantiate Bluetooth Serial ob
 #define THR_K            1.0f                  // Scaling factor for adaptive threshold calculation
 #define LOW_AMP_THRESH   40                    // Threshold for detecting low amplitude signal (flagging)
 
+// ============ Button Debounce variables =========
+static uint32_t lastDebounceSample = 0;
+const int DEBOUNCE_INTERVAL_MS = 20;     // Button sampled every 20 ms
+
 // ========== Buffers and state variables ==========
 static char jsonBuf[640], tmpBuf[48];          // Buffers for composing JSON strings to send over Bluetooth
 volatile uint16_t seq = 0;                      // Sequence number incremented for each full data packet
@@ -124,21 +128,25 @@ void loop() {
   uint32_t now = millis();                            // Get current time in milliseconds
 
   // --- Button debounce and recording toggle logic (count-based) ---
-  int currReading = digitalRead(PIN_BTN);             // Read raw digital state (HIGH or LOW) of button
+  if (millis() - lastDebounceSample >= DEBOUNCE_INTERVAL_MS) {   //checks if the 20ms has elasppsed before reading
+    lastDebounceSample = millis();
 
-  if (currReading == lastReading) {                    // If input unchanged from last sample increment stability counter
-    stableCount++;
-  } else {                                             // Otherwise reset stability counter to zero
-    stableCount = 0;
-  }
-  lastReading = currReading;                            // Update lastReading for next iteration
+    int currReading = digitalRead(PIN_BTN);
+    if (currReading == lastReading) {
+        stableCount++;
+    } else {
+        stableCount = 0;    // Otherwise reset stability counter to zero
+    }
+    lastReading = currReading;     // Update lastReading for next iteration
 
-  if (stableCount >= 5 && currReading != debouncedState) {  // If stable for >=5 reads and state changed
-    debouncedState = currReading;                       // Update debounced state
-    if (debouncedState == LOW) {                        // When button pressed (active LOW)
-      recording = !recording;                            // Toggle recording flag
+    if (stableCount >= 5 && currReading != debouncedState) {  // Makes a stable count of 5 to check a 100 ms stable reading
+        debouncedState = currReading;
+        if (debouncedState == LOW) {
+            recording = !recording;
+        }
     }
   }
+
 
   // --- Bluetooth LED display logic ---
   if (SerialBT.hasClient()) {                           // If Bluetooth host is connected
