@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BMET2922/9922 Wearable PPG GUI (Tkinter + Matplotlib)
+BMET2922/9922 Wearable PPG GUI (Tkinter + Matplotlib) + Serial backend + Drop Demo
 - Single window showing BPM (bars+trend) or Pulse waveform (toggle)
 - Visual alarms for high/low pulse; log window (timestamp format)
 - 5 s "no packet" watchdog using a Remote indicator + log
-- Backend thread accepts:
-    * JSON lines with {"bpm":72.3}  -> queue: ("bpm",(t,bpm))
-    * JSON lines with {"bpm":..., "samples":[50...], "seq":N, "flags":X, "t_mcu":ms}
-                                   -> queue: ("pkt",(t_host,bpm,samples,seq,flags,t_mcu))
-    * Plain lines like: 72.4
-- In simulation mode (no external command), it pushes frequent bpm values and
-  also emits a "pkt" once per second with 50 synthetic samples.
+- Accepts three backend sources:
+    1) External command (NDJSON over stdout) via backend_cmd
+    2) Serial port (NDJSON or plain BPM lines) via SERIAL_PORT
+    3) Built-in simulator (when both are disabled)
+- JSON lines:
+    {"bpm":72.3}
+    {"bpm":..., "samples":[50 ints], "seq":N, "flags":X, "t_mcu":ms}
+- Demo helper: "Simulate Drop (5s)" button to force 6s data ignore → triggers watchdog.
 """
+
 import os
 import sys
 import csv
@@ -39,6 +41,15 @@ try:
 except Exception:
     serial = None
 
+# ===================== User Config =====================
+# 串口（如果你走 Bluetooth SPP → 串口），把下面改成你 Mac 上的设备名
+# 例如：'/dev/tty.ESP32_PPG-SerialPort' 或 '/dev/tty.usbmodem1101'
+SERIAL_PORT: Optional[str] = None   # e.g. '/dev/tty.ESP32_PPG-SerialPort'
+SERIAL_BAUD: int = 115200
+
+# 外部命令（如果你想用管道方式，把串口当作“命令”来读）
+# 例如：backend_cmd = "cat /dev/tty.ESP32_PPG-SerialPort"
+BACKEND_CMD: Optional[str] = None
 
 # -------- Config --------
 HISTORY_SECONDS = 15
@@ -68,8 +79,12 @@ class AlarmDot(ttk.Frame):
             return "#f0f0f0"
 
 
-# ===== Optional: Serial reader thread =====
+# ===== Serial reader thread =====
 class SerialReader(threading.Thread):
+    """
+    Read text lines from a serial port and push them to GUI queue as ('raw', line).
+    Each line should end with '\n'. Supports NDJSON and '72.4' plain BPM lines.
+    """
     def __init__(self, port: str, baudrate: int, q: queue.Queue):
         super().__init__(daemon=True)
         if serial is None:
@@ -85,8 +100,10 @@ class SerialReader(threading.Thread):
                 if not line:
                     continue
                 text = line.decode('ascii', errors='ignore').strip()
-                self.q.put(text)
+                if text:
+                    self.q.put(("raw", text))
             except Exception:
+                # swallow decoding/IO errors
                 pass
 
     def stop(self):
@@ -100,6 +117,10 @@ class SerialReader(threading.Thread):
 
 # ===== Producer thread: reads external process or simulates data =====
 class BackendThread(threading.Thread):
+    """
+    External command backend OR simulator.
+    If cmd is None → simulator; otherwise read stdout lines and parse like SerialReader.
+    """
     def __init__(self, q: queue.Queue, cmd: Optional[str] = None):
         super().__init__(daemon=True)
         self.q = q
@@ -130,24 +151,8 @@ class BackendThread(threading.Thread):
                 line = (line or "").strip()
                 if not line:
                     continue
-                try:
-                    if line.startswith("{"):
-                        obj = json.loads(line)
-                        bpm = float(obj["bpm"])
-                        if "samples" in obj:
-                            samples = obj["samples"]
-                            seq = int(obj.get("seq", self.seq))
-                            self.seq = seq + 1
-                            flags = int(obj.get("flags", 0))
-                            t_mcu = int(obj.get("t_mcu", 0))
-                            self.q.put(("pkt", (time.time(), bpm, samples, seq, flags, t_mcu)))
-                        else:
-                            self.q.put(("bpm", (time.time(), bpm)))
-                    else:
-                        bpm = float(line.split(",")[0])
-                        self.q.put(("bpm", (time.time(), bpm)))
-                except Exception:
-                    self.q.put(("log", f"[PARSE] {line[:120]}"))
+                # 直接交给主线程解析：统一走 ('raw', line)
+                self.q.put(("raw", line))
 
             self.q.put(("log", "[BACKEND] finished"))
             return
@@ -170,12 +175,6 @@ class BackendThread(threading.Thread):
                 self.seq += 1
 
             time.sleep(1.0 / SAMPLE_HZ)
-
-
-'''
-反序列化（deserialize）：把 JSON 文本变成 Python 对象，便于安全读取 bpm、samples、seq 等字段。
-seq（sequence number）：递增序号，便于检测丢包/乱序与统计速率。
-'''
 
 
 # ===== Main GUI =====
@@ -242,6 +241,9 @@ class App:
                    command=lambda: self.mode.set("BPM")).pack(side="left", padx=2)
         ttk.Button(btns, text="PULSE",
                    command=lambda: self.mode.set("PULSE")).pack(side="left", padx=2)
+        # ---- Demo button: simulate 5s+ drop ----
+        ttk.Button(btns, text="Simulate Drop (5s)",
+                   command=lambda: self._simulate_drop(6)).pack(side="left", padx=2)
         ttk.Button(btns, text="EXIT", command=lambda: self.root.destroy()).pack(side="left", padx=2)
 
         # Threshold sliders
@@ -271,12 +273,28 @@ class App:
         self.backend = BackendThread(self.q, backend_cmd)
         self.backend.start()
 
+        # Serial (optional)
+        self.serial_thread = None
+        if SERIAL_PORT is not None:
+            if serial is None:
+                self._log(f"[Serial] pyserial not installed; cannot open {SERIAL_PORT}")
+            else:
+                try:
+                    self.serial_thread = SerialReader(SERIAL_PORT, SERIAL_BAUD, self.q)
+                    self.serial_thread.start()
+                    self._log(f"[Serial] opened {SERIAL_PORT} @ {SERIAL_BAUD}")
+                except Exception as e:
+                    self._log(f"[Serial] open failed: {e}")
+
         # Watchdog & waveform buffers
         self.last_pkt_ts = 0.0
         self.miss_alarm_on = False
         self.wave_t, self.wave_y = deque(), deque()
         self._after_poll = None
         self._after_draw = None
+
+        # ---- Demo gate: ignore incoming packets until this timestamp (seconds) ----
+        self._drop_until = 0.0
 
         # schedule periodic tasks
         self._after_poll = self.root.after(UI_UPDATE_MS, self._poll_queue)
@@ -321,6 +339,11 @@ class App:
             self._last_alarm = s
             self._log(s)
 
+    # --- demo: simulate N seconds of drop (ignore incoming data) ---
+    def _simulate_drop(self, seconds=6):
+        self._drop_until = time.time() + float(seconds)
+        self._log(f"[Demo] Simulating no packets for {int(seconds)} s")
+
     # --- queue polling: gather bpm and packets ---
     def _poll_queue(self):
         if getattr(self, "_closing", False):
@@ -328,16 +351,72 @@ class App:
         try:
             while True:
                 typ, payload = self.q.get_nowait()
+
                 if typ == "log":
                     self._log(payload)
+
+                elif typ == "raw":
+                    # Parse a single text line (from Serial or external cmd): NDJSON or '72.4'
+                    line = (payload or "").strip()
+                    try:
+                        if line.startswith("{"):
+                            obj = json.loads(line)
+                            bpm = float(obj["bpm"])
+                            if time.time() < getattr(self, "_drop_until", 0.0):
+                                # demo gate: ignore during drop window
+                                continue
+                            if "samples" in obj:
+                                samples = obj["samples"]
+                                seq = int(obj.get("seq", 0))
+                                flags = int(obj.get("flags", 0))
+                                t_mcu = int(obj.get("t_mcu", 0))
+                                t_host = time.time()
+                                # handle as 'pkt'
+                                self.last_pkt_ts = t_host
+                                self.ts.append(t_host); self.bpm.append(bpm)
+                                base = t_host - 1.0
+                                for i, y in enumerate(samples):
+                                    self.wave_t.append(base + i/50.0)
+                                    self.wave_y.append(y)
+                            else:
+                                # handle as 'bpm'
+                                t = time.time()
+                                self.last_pkt_ts = t
+                                self.ts.append(t); self.bpm.append(bpm)
+                        else:
+                            # plain BPM line
+                            if time.time() < getattr(self, "_drop_until", 0.0):
+                                continue
+                            bpm = float(line.split(",")[0])
+                            t = time.time()
+                            self.last_pkt_ts = t
+                            self.ts.append(t); self.bpm.append(bpm)
+                    except Exception:
+                        # bad line → record trimmed content for debugging
+                        self._log(f"[PARSE] {line[:120]}")
+
+                    # trim buffers (same as below)
+                    cutoff = time.time() - HISTORY_SECONDS
+                    while self.ts and self.ts[0] < cutoff:
+                        self.ts.popleft(); self.bpm.popleft()
+                    while self.wave_t and self.wave_t[0] < cutoff:
+                        self.wave_t.popleft(); self.wave_y.popleft()
+
                 elif typ == "bpm":
+                    # demo gate
+                    if time.time() < getattr(self, "_drop_until", 0.0):
+                        continue
                     t, v = payload
                     self.last_pkt_ts = t
                     self.ts.append(t); self.bpm.append(v)
                     cutoff = time.time() - HISTORY_SECONDS
                     while self.ts and self.ts[0] < cutoff:
                         self.ts.popleft(); self.bpm.popleft()
+
                 elif typ == "pkt":
+                    # demo gate
+                    if time.time() < getattr(self, "_drop_until", 0.0):
+                        continue
                     t_host, bpm, samples, seq, flags, t_mcu = payload
                     self.last_pkt_ts = t_host
                     self.ts.append(t_host); self.bpm.append(bpm)
@@ -350,6 +429,7 @@ class App:
                         self.ts.popleft(); self.bpm.popleft()
                     while self.wave_t and self.wave_t[0] < cutoff:
                         self.wave_t.popleft(); self.wave_y.popleft()
+
         except queue.Empty:
             pass
         except Exception as e:
@@ -427,7 +507,7 @@ class App:
             self.mean_var.set(f"{mean_v:.1f}" if not np.isnan(mean_v) else "--.-")
             self.curr_var.set(f"{curr_v:.1f}")
 
-            # --- high/low alarms（阈值报警：满足你的三点要求） ---
+            # --- high/low alarms（阈值报警：按你要求） ---
             low = float(self.low_var.get())
             high = float(self.high_var.get())
 
@@ -442,7 +522,7 @@ class App:
                 self.dot_low.set_color("#222")
                 self._log_once("Pulse High")
             else:
-                # 正常：两灯均灰（不写“恢复”日志，若需要可添加 self._log_once("Pulse Normal")）
+                # 正常：两灯均灰
                 self.dot_high.set_color("#222")
                 self.dot_low.set_color("#222")
 
@@ -653,6 +733,8 @@ def _App__poll_queue_addon(self: App):
                 self._log(payload)
 
             elif typ == "bpm":
+                if time.time() < getattr(self, "_drop_until", 0.0):
+                    continue
                 t, v = payload
                 self.last_pkt_ts = t
                 self.ts.append(t); self.bpm.append(v)
@@ -661,6 +743,8 @@ def _App__poll_queue_addon(self: App):
                     self.ts.popleft(); self.bpm.popleft()
 
             elif typ == "pkt":
+                if time.time() < getattr(self, "_drop_until", 0.0):
+                    continue
                 t_host, bpm, samples, seq, flags, t_mcu = payload
                 self.last_pkt_ts = t_host
                 self.ts.append(t_host); self.bpm.append(bpm)
@@ -670,7 +754,7 @@ def _App__poll_queue_addon(self: App):
                     self.wave_t.append(base + i/50.0)
                     self.wave_y.append(y)
 
-                # latency & loss tracking
+                # latency & loss tracking (optional metrics)
                 try:
                     lat = (t_host - (t_mcu/1000.0)) * 1000.0
                     self._lat_ms.append(max(0.0, float(lat)))
@@ -683,15 +767,47 @@ def _App__poll_queue_addon(self: App):
                 except Exception as e:
                     self._log(f"[Researcher] metric error: {e}")
 
-                # optional CSV recording
-                try:
-                    if getattr(self, "_recording", False) and self._rec_writer:
-                        samples_str = "[" + ",".join(str(int(s)) for s in samples) + "]"
-                        self._rec_writer.writerow([f"{t_host:.3f}", int(t_mcu), f"{bpm:.3f}", int(seq), int(flags), samples_str])
-                except Exception as e:
-                    self._log(f"[REC] write failed: {e}")
-
                 # trim buffers
+                cutoff = time.time() - HISTORY_SECONDS
+                while self.ts and self.ts[0] < cutoff:
+                    self.ts.popleft(); self.bpm.popleft()
+                while self.wave_t and self.wave_t[0] < cutoff:
+                    self.wave_t.popleft(); self.wave_y.popleft()
+
+            elif typ == "raw":
+                line = (payload or "").strip()
+                try:
+                    if line.startswith("{"):
+                        obj = json.loads(line)
+                        bpm = float(obj["bpm"])
+                        if time.time() < getattr(self, "_drop_until", 0.0):
+                            continue
+                        if "samples" in obj:
+                            samples = obj["samples"]
+                            seq = int(obj.get("seq", 0))
+                            flags = int(obj.get("flags", 0))
+                            t_mcu = int(obj.get("t_mcu", 0))
+                            t_host = time.time()
+                            self.last_pkt_ts = t_host
+                            self.ts.append(t_host); self.bpm.append(bpm)
+                            base = t_host - 1.0
+                            for i, y in enumerate(samples):
+                                self.wave_t.append(base + i/50.0)
+                                self.wave_y.append(y)
+                        else:
+                            t = time.time()
+                            self.last_pkt_ts = t
+                            self.ts.append(t); self.bpm.append(bpm)
+                    else:
+                        if time.time() < getattr(self, "_drop_until", 0.0):
+                            continue
+                        bpm = float(line.split(",")[0])
+                        t = time.time()
+                        self.last_pkt_ts = t
+                        self.ts.append(t); self.bpm.append(bpm)
+                except Exception:
+                    self._log(f"[PARSE] {line[:120]}")
+
                 cutoff = time.time() - HISTORY_SECONDS
                 while self.ts and self.ts[0] < cutoff:
                     self.ts.popleft(); self.bpm.popleft()
@@ -716,7 +832,7 @@ def main():
         style = ttk.Style(); style.theme_use("clam")
     except Exception:
         pass
-    app = App(root, backend_cmd=None)  # backend_cmd=None → 模拟数据；接真机改成你的命令
+    app = App(root, backend_cmd=BACKEND_CMD)  # 可选：外部命令；也可只用 SERIAL_PORT 或模拟
     root.mainloop()
 
 if __name__ == "__main__":
